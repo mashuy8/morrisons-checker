@@ -6,13 +6,14 @@ RUN apt-get update && apt-get install -y \
     gnupg \
     unzip \
     curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# تثبيت Chrome
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list \
+# تثبيت Chrome بطريقة جديدة
+RUN wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get update \
-    && apt-get install -y google-chrome-stable \
+    && apt-get install -y ./google-chrome-stable_current_amd64.deb \
+    && rm google-chrome-stable_current_amd64.deb \
     && rm -rf /var/lib/apt/lists/*
 
 # تثبيت ChromeDriver
@@ -35,8 +36,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # نسخ ملفات التطبيق
 COPY . .
 
-# إنشاء ملفات فارغة إذا لم تكن موجودة
-RUN touch cards.txt emails.txt proxies.txt
+# إنشاء مجلد templates إذا لم يكن موجوداً
+RUN mkdir -p templates
 
 # تعيين المتغيرات البيئية
 ENV DISPLAY=:99
