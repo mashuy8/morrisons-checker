@@ -574,6 +574,13 @@ def run_checker(work_type, use_proxy, cards_data, emails_data, proxies_data):
             options.add_argument("--window-size=1920,1080")
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-dev-shm-usage")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--disable-software-rasterizer")
+            options.add_argument("--disable-extensions")
+            options.add_argument("--remote-debugging-port=9222")
+            options.add_argument("--disable-setuid-sandbox")
+            options.add_argument("--single-process")
+            options.binary_location = "/usr/bin/google-chrome"
 
             if use_proxy and proxies_chrome:
                 proxy = random.choice(proxies_chrome)
