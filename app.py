@@ -522,14 +522,18 @@ def check_func(driver, cards, user_session, rounds=1):
                     f.write(f"{card}\n")
 
         except Exception as e:
-            user_session.results_queue.put({"type": "error", "card": card, "message": str(e)})
+            error_msg = str(e)[:150]
+            print(f"[ERROR] Card check failed: {error_msg}", flush=True)
+            user_session.results_queue.put({"type": "fail", "card": card, "message": error_msg})
             
     return True
 
 
 def login_func(driver, email):
+    print(f"[LOGIN] Starting login with email: {email[0] if email else 'None'}", flush=True)
     try:
         driver.get('https://groceries.morrisons.com/login')
+        print(f"[LOGIN] Navigated to login page", flush=True)
         time.sleep(3)
         
         try:
@@ -598,6 +602,7 @@ def register_func(driver):
 
 
 def run_checker(session_id, work_type, use_proxy, cards_data, emails_data, proxies_data):
+    print(f"[RUN] Starting checker - work_type: {work_type}, use_proxy: {use_proxy}", flush=True)
     user_session = get_user_session(session_id)
     
     user_session.is_running = True
@@ -623,7 +628,9 @@ def run_checker(session_id, work_type, use_proxy, cards_data, emails_data, proxi
     while not user_session.should_stop and cards:
         driver = None
         try:
+            print(f"[RUN] Creating Chrome driver...", flush=True)
             driver = create_chrome_driver(use_proxy, proxies_chrome, session_folder)
+            print(f"[RUN] Chrome driver created successfully", flush=True)
 
             if emails:
                 email = random.choice(emails).split("|")
@@ -639,7 +646,9 @@ def run_checker(session_id, work_type, use_proxy, cards_data, emails_data, proxi
             check_func(driver, cards, user_session, rounds=1)
 
         except Exception as e:
-            user_session.results_queue.put({"type": "error", "card": "System", "message": str(e)})
+            error_msg = str(e)[:200]
+            print(f"[RUN ERROR] {error_msg}", flush=True)
+            user_session.results_queue.put({"type": "fail", "card": "System", "message": error_msg})
 
         finally:
             if driver:
